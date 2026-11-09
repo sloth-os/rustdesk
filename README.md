@@ -33,6 +33,26 @@ One online visit makes the app fully usable offline (LAN without internet):
   latency probe can never abort module eval. The e2e gate itself serves
   the app over https with a mixed-content canary, so this class of bug
   fails CI, not production.
+- **Zero public-infrastructure traffic.** The stock bridge probes
+  RustDesk's public rendezvous fleet (`rs-sg`/`rs-cn`/`rs-us.rustdesk.com`)
+  at module scope, defaults ID connections to it, and falls back to
+  `admin.rustdesk.com` as API server. This build empties the fleet and
+  neutralises both defaults, so the page makes **no automatic requests to
+  any `rustdesk.com` host** — the e2e gate fails CI on any such HTTP or
+  WebSocket request. Remaining `rustdesk.com` strings are documentation
+  links, opened only on click. Every connection (ID or `IP:port` — the web
+  bridge has no direct-dial path) is resolved through the rendezvous
+  server: set your own in the settings dialog
+  (`custom-rendezvous-server`). Without one, connect attempts fail fast
+  locally instead of falling back to the public fleet.
+- **Deploy handoff.** Service workers update in the background
+  (`skipWaiting` + `clients.claim`), but browsers never reload open tabs —
+  without help, a tab open across a deploy (and the first visit after one,
+  where the OLD worker still serves the cached old bridge under its
+  bare-path cache key) runs the previous build for the whole session.
+  `index.html` now reloads once on `controllerchange` — guarded so the
+  first-visit claim never reloads mid-boot — and e2e phase 4 simulates a
+  full deploy handoff.
 - **Proven weekly-fresh.** Every run asserts the pinned toolchain and
   source SHAs, and the e2e gate must pass before anything is deployed.
 

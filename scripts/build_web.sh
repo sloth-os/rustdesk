@@ -32,6 +32,7 @@ WEBDEPS_SHA256=b66011c4fc066b90c46ba0c78884fe5d1a7e5a7fad3dce401300ad893de63818
 export RD_DIR FONTS_DIR PUBGIT_DIR
 export PATH="$FLUTTER_DIR/bin:$PROTOC_DIR:$PATH"
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 [ -d "$RD_DIR/flutter" ] || { log "RD_DIR/flutter missing: $RD_DIR"; exit 1; }
 [ -x "$FLUTTER_DIR/bin/flutter" ] || { log "flutter SDK missing: $FLUTTER_DIR"; exit 1; }
@@ -47,6 +48,21 @@ fi
 # ---------------- [0] JS bridge (yarn berry 3.6.4 + vite 2.8) ----------------
 log "[0] JS bridge build"
 cd "$RD_DIR/flutter" || exit 1
+# Staleness guards (local rehearsal): this step skips when web/jds exists,
+# and step [5] deletes web/js after staging — a re-run after editing the
+# patch blocks below would silently repackage the OLD bridge (false-green
+# rehearsal). Refuse when freshness is unverifiable; rebuild when sources
+# or this script are newer than the staged bundle. CI is immune (fresh
+# clone: web/jds never pre-exists).
+if [ -f web/jds/index.js ] && [ ! -d web/js/src ]; then
+  log "  BRIDGE_STALE_RISK: web/jds is staged but web/js/src is gone — cannot"
+  log "  verify freshness; remove web/jds (and re-extract sources) to rebuild"
+  exit 1
+fi
+if [ -f web/jds/index.js ] && [ -n "$(find web/js/src "$SELF" -newer web/jds/index.js -print -quit 2>/dev/null)" ]; then
+  log "  src/ or build_web.sh newer than staged bridge — forcing rebuild"
+  rm -rf web/jds web/js/dist
+fi
 if [ -f web/jds/index.js ]; then
   log "  already staged (web/jds present)"
 else
@@ -119,8 +135,61 @@ if 'testDelay skipped' not in s:
     assert s.count(old) == 1, 'testDelay anchor missing'
     s = s.replace(old, new, 1)
     changed.append('testDelay guarded')
+# (c) zero public-infrastructure traffic: stock RustDesk hard-codes its
+# public rendezvous fleet and probes it at module scope (testDelay above);
+# this build targets self-hosted/LAN deployments and must make ZERO
+# requests to rustdesk.com (CI-enforced by the e2e gate). Empty fleet =>
+# the probe iterates nothing; the default ID server becomes the user's own
+# custom-rendezvous-server setting, empty otherwise (connect attempts then
+# fail fast locally with an invalid-URL error instead of phoning home).
+if 'const HOSTS: string[] = [];' not in s:
+    old = '''const HOSTS = [
+  "rs-sg.rustdesk.com",
+  "rs-cn.rustdesk.com",
+  "rs-us.rustdesk.com",
+];'''
+    new = '''// Empty by design: stock RustDesk probes this public fleet at module
+// scope and falls back to it for ID-based connections. This build makes
+// ZERO requests to rustdesk.com; point the settings dialog at your own
+// ID server (custom-rendezvous-server) instead.
+const HOSTS: string[] = [];'''
+    assert s.count(old) == 1, 'HOSTS anchor missing'
+    s = s.replace(old, new, 1)
+    changed.append('public fleet removed')
+if 'getItem("custom-rendezvous-server") || "";' not in s:
+    old = 'let HOST = localStorage.getItem("rendezvous-server") || HOSTS[0];'
+    new = 'let HOST = localStorage.getItem("custom-rendezvous-server") || "";'
+    assert s.count(old) == 1, 'HOST anchor missing'
+    s = s.replace(old, new, 1)
+    changed.append('default ID server = custom setting')
 open(p, 'w').write(s)
 print('  connection.ts:', ', '.join(changed) if changed else 'already patched')
+p = 'src/globals.js'
+s = open(p).read()
+changed = []
+# (d) the API-server fallback must not phone home either
+if 'no public API default' not in s:
+    old = "  return 'https://admin.rustdesk.com';"
+    new = "  return ''; // no public API default (zero rustdesk.com traffic)"
+    assert s.count(old) == 1, 'admin API anchor missing'
+    s = s.replace(old, new, 1)
+    changed.append('admin API default removed')
+# (e) upstream import bug (found + adversarially confirmed while tracing
+# every apiServer path for the zero-traffic change): PORT is a NAMED export
+# of connection.ts — its DEFAULT export is the Connection class, already
+# imported on line 1 — so the default import binds the class and
+# getApiServer's portless-custom-server branch computes
+# `http://host:${Connection - 2}` = "http://host:NaN", which makes Dart's
+# Uri.parse throw FormatException in web-login/audit/address-book calls.
+# A self-hosted ID server WITHOUT an explicit port is the common case.
+if 'import { PORT } from "./connection";' not in s:
+    old = 'import PORT from "./connection";'
+    new = 'import { PORT } from "./connection";'
+    assert s.count(old) == 1, 'PORT import anchor missing'
+    s = s.replace(old, new, 1)
+    changed.append('PORT named import')
+open(p, 'w').write(s)
+print('  globals.js:', ', '.join(changed) if changed else 'already patched')
 PYEOF
   [ $? -eq 0 ] || { log "BRIDGE_PATCH_FAIL"; exit 1; }
   # --no-immutable: runners export CI=true, which makes Yarn default to
@@ -174,6 +243,34 @@ if "postMessage('downloadOffline')" not in s:
     assert anchor in s, 'trigger anchor missing'
     s = s.replace(anchor, ins + anchor, 1)
     changed.append('precache trigger')
+# deploy auto-handoff: the SW updates in the background (skipWaiting +
+# clients.claim) but nothing reloads controlled clients — a tab open across
+# a deploy, and the FIRST visit after one (where the OLD worker still
+# serves the cached old bridge under its bare-path cache key, new ?v=
+# notwithstanding), would run the previous build for the whole session.
+# One-shot reload on controllerchange closes that window. Guards: reload
+# only if the document already had a controlling worker at eval time (a
+# real upgrade takeover — the first-visit claim goes null -> worker and
+# must NOT reload mid-boot), and at most once per document.
+if 'controllerchange' not in s:
+    anchor = "      // Service workers are supported. Use them.\n"
+    ins = """      // Service workers are supported. Use them.
+      // One-time auto-handoff to a fresh deploy: reload only if this
+      // document already had a controlling worker at load time (a real
+      // upgrade takeover), not on the first-visit claim (null -> worker).
+      const hadController = !!navigator.serviceWorker.controller;
+      let swReloaded = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (hadController && !swReloaded) {
+          swReloaded = true;
+          console.log('New service worker took over; reloading once.');
+          location.reload();
+        }
+      });
+"""
+    assert s.count(anchor) == 1, 'controllerchange anchor missing'
+    s = s.replace(anchor, ins, 1)
+    changed.append('controllerchange auto-reload')
 open(p, 'w').write(s)
 print('  index.html:', ', '.join(changed) if changed else 'already patched')
 PYEOF
@@ -455,7 +552,17 @@ sw = open('flutter_service_worker.js').read()
 ih = open('index.html').read()
 mdj = open('main.dart.js', encoding='utf-8').read()
 jds = open('jds/index.js').read()
+vnd = open('jds/vendor.js').read()
 man = json.load(open('manifest.json'))
+
+# (e) getApiServer must derive the API port from the PORT const. Minified
+# shape: `http://${h}:${P-2}` with P bound to 21116 somewhere in a chunk;
+# the upstream default-import bug bound the Connection class here instead
+# (runtime "http://host:NaN"). Name-agnostic so esbuild renaming can't
+# vacuously pass it: capture the identifier, then require its =21116 binding.
+_m = re.search(r'http://\$\{\w+\}:\$\{(\w+)-2\}', jds + vnd)
+_api_port_ok = bool(_m) and bool(
+    re.search(r'\b' + re.escape(_m.group(1)) + r'=21116\b', jds + vnd))
 
 # patch markers
 checks = [
@@ -465,6 +572,7 @@ checks = [
   ('bare-path cache.put', sw.count("url.split('?')[0]"), 1),
   ('activate precache triggers', sw.count('downloadOffline().catch'), 2),
   ('page-side precache trigger', ih.count("postMessage('downloadOffline')"), 1),
+  ('controllerchange auto-reload', ih.count('controllerchange'), 1),
   ('jds cache-busted', ih.count('jds/index.js?v=') + ih.count('jds/vendor.js?v='), 2),
   ('firebase gone', ih.count('firebase'), 0),
   ('gstatic gone from main.dart.js', mdj.count('gstatic'), 0),
@@ -476,6 +584,21 @@ checks = [
   ('bridge page-scheme probe', jds.count('"https:"'), 1),
   ('bridge ws branch (http pages)', jds.count('"ws://"'), 1),
   ('bridge testDelay guard', jds.count('testDelay skipped'), 1),
+  # zero public-infrastructure traffic — fleet + admin default are gone
+  # from BOTH minified chunks (which chunk a module lands in is vite's
+  # decision; a 'want 0' count on one file could otherwise pass vacuously).
+  # rustdesk.com/doc-link strings intentionally remain: they are
+  # click-opened links, never automatic requests
+  ('no public rendezvous fleet',
+   jds.count('rs-sg.rustdesk.com') + jds.count('rs-cn.rustdesk.com')
+   + jds.count('rs-us.rustdesk.com') + vnd.count('rs-sg.rustdesk.com')
+   + vnd.count('rs-cn.rustdesk.com') + vnd.count('rs-us.rustdesk.com'), 0),
+  ('no public API default',
+   jds.count('admin.rustdesk.com') + vnd.count('admin.rustdesk.com'), 0),
+  # the SW must never gain a rustdesk.com RESOURCES key/update URL either
+  # (main.dart.js/jds keep click-only rustdesk.com doc links by design)
+  ('service worker free of rustdesk.com', sw.count('rustdesk.com'), 0),
+  ('api port derived from PORT const', _api_port_ok, True),
 ]
 ok = True
 for name, got, want in checks:

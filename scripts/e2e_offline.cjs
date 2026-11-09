@@ -14,10 +14,18 @@
 // Phase 1: first visit online — SW installs, precaches every RESOURCES entry
 //          (incl. lazily-loaded codec wasm); no external font/cdn requests;
 //          app renders; bridge module evaluated (window.init defined).
+//          Plus the runtime zero-traffic proof: the legacy
+//          'rendezvous-server' key (old builds left it pointing at the
+//          public fleet) is seeded, api/audit server resolution and an
+//          explicit connect attempt are exercised — no rustdesk.com
+//          socket or request may ever appear.
 // Phase 2: HARD PATH — go offline immediately (no online reload first).
 //          Reload: navigation, jds/*.js?v=, canvaskit, fonts, ogv workers
 //          (?version=) must all come from cache.
 // Phase 3: second offline reload — stability of the fully-cached boot.
+// Phase 4: deploy handoff — mutate bridge/SW/version on disk mid-session;
+//          ONE manual reload must auto-hand off (controllerchange) to the
+//          new build and serve the fresh bridge, never the stale cache.
 //
 // Render proof is DOM-independent: canvaskit draws into a canvas inside
 // flt-glass-pane's SHADOW ROOT (light-DOM querySelector cannot see it), so we
@@ -33,6 +41,7 @@ const https = require('https');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
 let chromium;
@@ -113,7 +122,17 @@ function watch(page, tag) {
     if (new URL(u).host === HOST) failures.push(`${tag}: same-origin requestfailed ${u} (${r.failure()?.errorText})`);
   });
   page.on('request', (r) => { const u = r.url();
-    if (/gstatic|googleapis|google\.com/.test(u)) failures.push(`${tag}: external font/cdn request ${u}`); });
+    if (/gstatic|googleapis|google\.com/.test(u)) failures.push(`${tag}: external font/cdn request ${u}`);
+    // zero public-infrastructure traffic: no automatic request to any
+    // rustdesk.com host may ever leave the page (docs links are click-only
+    // and open in a new tab, so they never surface here)
+    if (/(^|\.)rustdesk\.com$/.test(new URL(u).hostname))
+      failures.push(`${tag}: request to rustdesk.com public infrastructure: ${u}`); });
+  // the stock rendezvous probe uses WebSockets, which don't fire 'request'
+  page.on('websocket', (ws) => {
+    if (/(^|\.)rustdesk\.com$/.test(new URL(ws.url()).hostname))
+      failures.push(`${tag}: WebSocket to rustdesk.com public infrastructure: ${ws.url()}`);
+  });
 }
 
 async function waitBoot(page, tag, ms = 90000) {
@@ -207,6 +226,13 @@ let HOST;
     ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
   // context-level too (belt-and-braces next to the browser flag above)
   const ctx = await browser.newContext({ locale: 'zh-CN', ignoreHTTPSErrors: true });
+  // Pre-zero-traffic builds wrote the winning public-fleet host into
+  // localStorage['rendezvous-server'] on every visit. Seed that stale key
+  // for every phase: the patched bridge must ignore it entirely — proven
+  // by the phase-1 connect attempt below plus the rustdesk.com gates.
+  await ctx.addInitScript(() => {
+    try { localStorage.setItem('rendezvous-server', 'rs-sg.rustdesk.com'); } catch {}
+  });
   const page = await ctx.newPage();
 
   // ---- phase 1: first visit, online ----
@@ -247,6 +273,22 @@ let HOST;
     await page.evaluate(() => performance.getEntriesByType('resource').some((e) => e.name.includes('/fonts/notosanssc/'))));
   await renderCheck(page, 'p1');
 
+  // ---- phase 1b: runtime zero-traffic proof. The request/websocket gates
+  // observe everything, but boot alone never exercises the paths that used
+  // to phone home: resolve the api/audit servers and attempt a connect with
+  // the stale legacy key seeded (no custom server configured) ----
+  const apiServer = await page.evaluate(() => window.getByName('api_server'));
+  const auditServer = await page.evaluate(() => window.getByName('audit_server', 'conn'));
+  console.log(`${ts()} [p1] api_server=${JSON.stringify(apiServer)} audit_server=${JSON.stringify(auditServer)}`);
+  if (/rustdesk\.com/.test(String(apiServer)) || /rustdesk\.com/.test(String(auditServer)))
+    failures.push(`p1: api/audit server resolves to public infrastructure: ${apiServer} / ${auditServer}`);
+  // The connect must fail LOCALLY (getDefaultUri() yields the invalid
+  // "wss://:21118", surfaced as a msgbox) without opening any socket; if
+  // anything dials the fleet, the websocket gate above fails the run.
+  await page.evaluate(() => window.setByName('connect', '123456789'));
+  await page.waitForTimeout(4000);
+  console.log(`${ts()} [p1] connect attempt done — gate saw no rustdesk.com traffic`);
+
   // ---- phase 2: offline IMMEDIATELY, reload (hard path) ----
   await ctx.setOffline(true);
   console.log(`${ts()} --- OFFLINE (no online reload in between) ---`);
@@ -262,6 +304,64 @@ let HOST;
   await page.reload({ waitUntil: 'domcontentloaded' });
   await waitBoot(page, 'p3');
   await renderCheck(page, 'p3');
+
+  // ---- phase 4: deploy handoff. Simulate a weekly redeploy under a live
+  // session: mutate the on-disk bridge (md5 change => activate() evicts the
+  // stale cache entry), the SW bytes (=> update installs), and bump
+  // serviceWorkerVersion (=> index.html takes the reg.update() branch).
+  // The first manual reload may still be served by the OLD worker, but its
+  // one-shot controllerchange listener must auto-reload onto the NEW build
+  // — no second manual reload, no session spent on the previous deploy. ----
+  await ctx.setOffline(false);
+  const fJds = path.join(WEB, 'jds/index.js');
+  const fSw = path.join(WEB, 'flutter_service_worker.js');
+  const fHtml = path.join(WEB, 'index.html');
+  const backup = { jds: fs.readFileSync(fJds, 'utf8'),
+    sw: fs.readFileSync(fSw, 'utf8'), html: fs.readFileSync(fHtml, 'utf8') };
+  const MARKER = 'e2e-handoff-marker';
+  const navs = [];
+  page.on('framenavigated', (fr) => { if (fr === page.mainFrame()) navs.push(fr.url()); });
+  const p4msgs = [];
+  page.on('console', (m) => p4msgs.push(m.text()));
+  try {
+    fs.writeFileSync(fJds, backup.jds + `\n//${MARKER}\n`);
+    const newMd5 = crypto.createHash('md5').update(fs.readFileSync(fJds)).digest('hex');
+    const sw2 = backup.sw.replace(/("jds\/index\.js":\s*)"[a-f0-9]{32}"/, `$1"${newMd5}"`);
+    if (sw2 === backup.sw) throw new Error('phase4: jds md5 anchor missing from RESOURCES');
+    fs.writeFileSync(fSw, sw2 + `\n//${MARKER}\n`);
+    const html2 = backup.html.replace(/serviceWorkerVersion = "(\d+)"/,
+      (m, d) => `serviceWorkerVersion = "${+d + 1}"`);
+    if (html2 === backup.html) throw new Error('phase4: serviceWorkerVersion anchor missing');
+    const newVer = html2.match(/serviceWorkerVersion = "(\d+)"/)[1];
+    fs.writeFileSync(fHtml, html2);
+
+    navs.length = 0;
+    await page.reload({ waitUntil: 'domcontentloaded' });  // the user's revisit
+    // The new worker installs in the background, evicts the stale jds entry
+    // (md5 manifest diff) and claims the page; the document's one-shot
+    // controllerchange listener must then reload itself exactly once.
+    await page.waitForFunction(
+      (ver) => navigator.serviceWorker.controller &&
+        navigator.serviceWorker.controller.scriptURL.endsWith(ver),
+      newVer, { timeout: 60000 });
+    const t4 = Date.now();
+    while (navs.length < 2 && Date.now() - t4 < 30000) await page.waitForTimeout(500);
+    if (navs.length < 2)
+      failures.push(`p4: controllerchange auto-reload never fired (${navs.length} navigation(s)) — a deploy would leave the stale build resident all session`);
+    if (!p4msgs.some((t) => t.includes('New service worker took over')))
+      failures.push('p4: takeover console marker missing');
+    await page.waitForLoadState('domcontentloaded');
+    await waitBoot(page, 'p4');
+    const fresh = await page.evaluate((mk) =>
+      fetch('jds/index.js').then((r) => r.text()).then((t) => t.includes(mk)), MARKER);
+    if (!fresh) failures.push('p4: post-handoff document was still served the STALE bridge (marker missing)');
+    await renderCheck(page, 'p4');
+    console.log(`${ts()} [p4] deploy handoff complete: ${navs.length} navigations, fresh bridge served`);
+  } finally {
+    fs.writeFileSync(fJds, backup.jds);
+    fs.writeFileSync(fSw, backup.sw);
+    fs.writeFileSync(fHtml, backup.html);
+  }
 
   await browser.close(); server.close();
 
