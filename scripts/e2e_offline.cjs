@@ -215,18 +215,24 @@ async function screenshotColors(page) {
 
 async function renderCheck(page, tag) {
   const box = await canvasProbe(page);
-  // first paint can land a few frames after boot — poll until the canvas
-  // actually has pixels (up to 30s).
+  // Threshold calibration (2026-11-09): nobody ever removes the index.html
+  // spinner, and being positioned it paints OVER the static glass pane
+  // until an opaque UI frame covers it — so glass+canvas (mere engine
+  // init) and a low color count are BOTH satisfied by a dead boot (the
+  // release-mode empty-container render of a build() throw looks exactly
+  // like this). Observed: spinner-only screenshots 4-18 distinct colors;
+  // the rendered home page 61 (headless chromium) to 73 (firefox). 30
+  // separates them with wide margin.
   let colors = 0;
   const tPaint = Date.now();
-  while (colors < 8 && Date.now() - tPaint < 30000) {
+  while (colors < 30 && Date.now() - tPaint < 30000) {
     colors = Math.max(colors, await screenshotColors(page));
-    if (colors < 8) await page.waitForTimeout(1500);
+    if (colors < 30) await page.waitForTimeout(1500);
   }
   console.log(`${ts()} [${tag}] canvas:`, JSON.stringify(box), 'screenshot colors:', colors,
     'cache:', await cacheCount(page));
   if (!box || !box.w) failures.push(`${tag}: no rendered canvas`);
-  if (colors < 8) failures.push(`${tag}: screenshot has only ${colors} distinct colors (app not rendered?)`);
+  if (colors < 30) failures.push(`${tag}: screenshot has only ${colors} distinct colors (spinner/blank — app UI not rendered)`);
 }
 
 let HOST;
@@ -255,7 +261,11 @@ let HOST;
   // origin stays a secure context — mixed-content enforcement is fully
   // active, which is the entire point of the https server.
   const browser = await chromium.launch({ headless: true,
-    args: ['--ignore-certificate-errors'],
+    // chromium >=137 makes software WebGL opt-in; without this flag
+    // canvaskit gets no GL context in headless and commits no frames at
+    // all (engine "initializes", spinner stays) — the gate would test
+    // nothing.
+    args: ['--ignore-certificate-errors', '--enable-unsafe-swiftshader'],
     ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
   // context-level too (belt-and-braces next to the browser flag above)
   const ctx = await browser.newContext({ locale: 'zh-CN', ignoreHTTPSErrors: true });

@@ -392,6 +392,66 @@ log "[6] flutter pub get"
 flutter pub get 2>&1 | tail -3
 [ -f .dart_tool/package_config.json ] || { log "PUBGET_FAIL"; exit 1; }
 
+log "[6b] dart web FFI stubs — the 1.2.5 web client cannot boot without these"
+# Upstream's web bridge stubs throw UnimplementedError for FFI methods the
+# desktop client implements in Rust. The mobile-style home page calls some
+# of them DURING ITS FIRST BUILD (home_page.dart:147,160 ->
+# mainGetAppNameSync for the app-bar title); a release-mode build() throw
+# renders an empty container, so the canvaskit scene stays transparent and
+# the index.html spinner paints over it FOREVER — no console error, no
+# pageerror, engine fully initialized. That is the true cause of every
+# "stuck on the loading page" report against this site (found 2026-11-09
+# via an instrumented build that named each throw; the ws:// and
+# zero-traffic fixes were necessary but not sufficient).
+# Stubs return conservative web semantics; each patch is apply-or-skip
+# idempotent, and an upstream change that moves an anchor fails the build
+# loudly instead of shipping a spinner.
+python3 - <<'PYEOF'
+import io, sys
+p = 'lib/web/bridge.dart'
+s = io.open(p, encoding='utf-8').read()
+def throw(sig):
+    return "  %s {\n    throw UnimplementedError();\n  }" % sig
+applied = already = 0
+def sub(old, new, tag):
+    # idempotent like every other patch here: pristine anchor -> apply;
+    # stub already present (local re-run) -> no-op; neither -> fail loudly
+    global s, applied, already
+    if s.count(old) == 1:
+        s = s.replace(old, new); applied += 1
+    elif s.count(new) >= 1:
+        already += 1
+    else:
+        sys.exit('anchor missing: ' + tag)
+STUBS = [
+  # app-bar title on the home page's first build — the boot killer
+  ("String mainGetAppNameSync({dynamic hint})", "    return 'RustDesk';"),
+  # no managed/locked options on web
+  ("bool mainIsOptionFixed({required String key, dynamic hint})", "    return false;"),
+  # canvaskit composites directly; there is no texture renderer on web
+  ("bool mainGetUseTextureRender({dynamic hint})", "    return false;"),
+  # no self-update story in a browser tab
+  ("Future<String> mainGetSoftwareUpdateUrl({dynamic hint})", "    return Future.value('');"),
+  # a web page is never root
+  ("Future<bool> mainIsRoot({dynamic hint})", "    return Future.value(false);"),
+  # no hardware codec/vram probing without the rust core
+  ("bool mainHasHwcodec({dynamic hint})", "    return false;"),
+  ("bool mainHasVram({dynamic hint})", "    return false;"),
+  ("String mainSupportedHwdecodings({dynamic hint})", "    return '[]';"),
+  # gesture timing default (ms); desktop-only consumer
+  ("int getDoubleClickTime({dynamic hint})", "    return 500;"),
+]
+for sig, body in STUBS:
+    sub(throw(sig), "  %s {\n%s\n  }" % (sig, body), sig)
+sub("  Future<String> mainGetBuildDate({dynamic hint}) {\n"
+    "    // TODO\n    throw UnimplementedError();\n  }",
+    "  Future<String> mainGetBuildDate({dynamic hint}) {\n"
+    "    // TODO\n    return Future.value('');\n  }", 'mainGetBuildDate')
+io.open(p, 'w', encoding='utf-8').write(s)
+print('  stubbed %d web FFI methods (%d already stubbed)' % (applied, already))
+PYEOF
+[ $? -eq 0 ] || { log "FFI_STUB_FAIL"; exit 1; }
+
 log "[7] flutter build web (canvaskit, local resources, /rustdesk/ base)"
 rm -rf build/web
 flutter build web --release \
@@ -564,6 +624,13 @@ _m = re.search(r'http://\$\{\w+\}:\$\{(\w+)-2\}', jds + vnd)
 _api_port_ok = bool(_m) and bool(
     re.search(r'\b' + re.escape(_m.group(1)) + r'=21116\b', jds + vnd))
 
+# the [6b] FFI stubs must be present in the exact sources this build
+# compiled: release-mode Flutter renders a build() throw as a transparent
+# scene, so one surviving UnimplementedError on the home page's first
+# build = spinner forever with no console error. cwd here is build/web;
+# the dart source is two levels up.
+bdg = open('../../lib/web/bridge.dart', encoding='utf-8').read()
+
 # patch markers
 checks = [
   ('origin pathname.replace', sw.count('pathname.replace'), 3),
@@ -599,6 +666,9 @@ checks = [
   # (main.dart.js/jds keep click-only rustdesk.com doc links by design)
   ('service worker free of rustdesk.com', sw.count('rustdesk.com'), 0),
   ('api port derived from PORT const', _api_port_ok, True),
+  ('web FFI app-name stub', bdg.count("return 'RustDesk';"), 1),
+  ('web FFI option-fixed stub',
+   bdg.count('mainIsOptionFixed({required String key, dynamic hint}) {\n    return false;'), 1),
 ]
 ok = True
 for name, got, want in checks:

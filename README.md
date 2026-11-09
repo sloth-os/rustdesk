@@ -33,6 +33,20 @@ One online visit makes the app fully usable offline (LAN without internet):
   latency probe can never abort module eval. The e2e gate itself serves
   the app over https with a mixed-content canary, so this class of bug
   fails CI, not production.
+- **Renders for real.** Upstream 1.2.5 ships web FFI stubs that throw
+  `UnimplementedError`, and the mobile-style home page calls two of them
+  (`mainGetAppNameSync`, `mainIsOptionFixed`) during its FIRST build.
+  Release-mode Flutter renders a `build()` throw as an empty container:
+  the canvaskit scene stays transparent, nothing is logged, and the
+  `index.html` spinner — which no code ever removes — paints over the
+  initialized-but-empty glass pane forever. Every stock 1.2.5 web build
+  is affected; no amount of network/bridge fixing helps until this is.
+  Build step `[6b]` stubs the ten boot-path methods with conservative web
+  semantics, anchor-verified so an upstream change fails the build loudly
+  instead of shipping a spinner. The e2e render gate is calibrated
+  against exactly this failure: a frame only counts when its pixel color
+  census separates real UI (73 distinct colors) from the spinner (≤18) —
+  DOM flags and low thresholds were proven vacuous (2026-11-09).
 - **Zero public-infrastructure traffic.** The stock bridge probes
   RustDesk's public rendezvous fleet (`rs-sg`/`rs-cn`/`rs-us.rustdesk.com`)
   at module scope, defaults ID connections to it, and falls back to
