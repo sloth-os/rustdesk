@@ -57,7 +57,11 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # ubuntu-latest migrated to Ubuntu 26 in Oct 2026; this pinned 2024-era
+    # toolchain (Flutter 3.19.6, Playwright 1.55's chromium-deps profile) is
+    # validated on 24.04. Re-pin deliberately when 24.04 runner images retire
+    # (the weekly run fails loudly, so drift is impossible to miss).
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Publisher repo (scripts + this workflow)
@@ -147,7 +151,7 @@ jobs:
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       pages: write
