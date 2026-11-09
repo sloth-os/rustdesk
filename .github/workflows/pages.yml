@@ -50,7 +50,9 @@ env:
   FLUTTER_VERSION: '3.19.6'
   FLUTTER_SHA256: 'db6742a20626d0d2a089eb41ad61b9b2138b996679911e9c8268c1f896191f97'
   WEBDEPS_SHA256: 'b66011c4fc066b90c46ba0c78884fe5d1a7e5a7fad3dce401300ad893de63818'
-  YARN_SHA256: '7f7d51b38db0d94adf25c512e3f3d3b47d23c97922eecc540f7440f116bdb99a'
+  # NB: must NOT start with "YARN_" — Yarn Berry treats every YARN_* env
+  # var as a config setting and aborts on unrecognized ones.
+  YARNBERRY_SHA256: '7f7d51b38db0d94adf25c512e3f3d3b47d23c97922eecc540f7440f116bdb99a'
   PLAYWRIGHT_VERSION: '1.55.0'
 
 jobs:
@@ -89,7 +91,7 @@ jobs:
         run: |
           curl $CURL_FLAGS -o /tmp/yarn-3.6.4.cjs \
             "https://repo.yarnpkg.com/3.6.4/packages/yarnpkg-cli/bin/yarn.js"
-          echo "$YARN_SHA256  /tmp/yarn-3.6.4.cjs" | sha256sum -c -
+          echo "$YARNBERRY_SHA256  /tmp/yarn-3.6.4.cjs" | sha256sum -c -
           node /tmp/yarn-3.6.4.cjs -v
 
       - name: protoc 36.2 (npm package — no system protoc needed)
