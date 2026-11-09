@@ -57,7 +57,10 @@ else
     log "  extracted web deps ($(tar tzf "$WEBDEPS" | wc -l) files)"
   fi
   cd web/js || exit 1
-  node "$YARN_CJS" install 2>&1 | tail -4
+  # --no-immutable: runners export CI=true, which makes Yarn default to
+  # immutable installs; the upstream lockfile isn't install-clean under
+  # 3.6.4 (YN0028), and mutation is fine in this disposable tree.
+  node "$YARN_CJS" install --no-immutable 2>&1 | tail -4
   [ -x node_modules/.bin/tsc ] || { log "YARN_INSTALL_FAIL"; exit 1; }
   node "$YARN_CJS" build 2>&1 | tail -8
   [ -f dist/index.js ] && [ -f dist/vendor.js ] || { log "BRIDGE_BUILD_FAIL"; exit 1; }
