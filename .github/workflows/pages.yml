@@ -1,0 +1,155 @@
+# Weekly rebuild + publish of the RustDesk 1.2.5 web client as an
+# offline-capable PWA at https://sloth-os.github.io/rustdesk/ (base-href
+# /rustdesk/).
+#
+# Pipeline (pinned end-to-end; every download sha256-verified):
+#   1. rustdesk/rustdesk at tag 1.2.5 — SHA-asserted against RD_SHA
+#   2. Flutter 3.19.6 tarball, Yarn Berry 3.6.4 standalone cjs, protoc 36.2
+#      (npm), Node 24
+#   3. scripts/fetch_fonts.sh   — pinned gstatic fallback fonts
+#   4. scripts/build_web.sh     — JS bridge (yarn/vite), flutter build web
+#      (canvaskit, --no-web-resources-cdn), the offline/PWA patch set
+#      (local fonts + canvaskit, subpath service worker, full precache
+#      incl. lazily-loaded codec wasm, firebase strip), hygiene asserts
+#   5. scripts/e2e_offline.cjs  — headless-chromium proof: 165/165 precache,
+#      offline reloads render, zero external requests
+#   6. commits build-info.json + per-file sha256 manifest — weekly
+#      provenance, and the repo activity that keeps this scheduled workflow
+#      from being auto-disabled after 60 idle days (no keepalive action:
+#      those were TOS-disabled by GitHub)
+#   7. deploys build/web to GitHub Pages
+#
+# ONE-TIME MANUAL STEP (the workflow token cannot do it):
+#   Settings -> Pages -> Build and deployment -> Source = "GitHub Actions"
+
+name: web build + pages publish
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'   # Mondays 04:00 UTC
+  workflow_dispatch:
+
+# contents: write is needed only for the provenance commit in `build`.
+# The `deploy` job narrows to the Pages/OIDC set.
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  RD_TAG: '1.2.5'
+  RD_SHA: '7d56717cf56bc3535832e2a89e4a87c5ca753f1e'
+  FLUTTER_VERSION: '3.19.6'
+  FLUTTER_SHA256: 'db6742a20626d0d2a089eb41ad61b9b2138b996679911e9c8268c1f896191f97'
+  WEBDEPS_SHA256: 'b66011c4fc066b90c46ba0c78884fe5d1a7e5a7fad3dce401300ad893de63818'
+  YARN_SHA256: '7f7d51b38db0d94adf25c512e3f3d3b47d23c97922eecc540f7440f116bdb99a'
+  PLAYWRIGHT_VERSION: '1.55.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Publisher repo (scripts + this workflow)
+        uses: actions/checkout@v7
+
+      - name: Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: RustDesk source at ${{ env.RD_TAG }} (SHA-asserted)
+        run: |
+          git clone --depth 1 --branch "$RD_TAG" https://github.com/rustdesk/rustdesk /tmp/rd125
+          test "$(git -C /tmp/rd125 rev-parse HEAD)" = "$RD_SHA" \
+            || { echo "::error::tag $RD_TAG moved ($RD_SHA expected)"; exit 1; }
+
+      - name: Flutter ${{ env.FLUTTER_VERSION }} (sha256-verified)
+        run: |
+          mkdir -p /tmp/flsdk
+          curl -fsSL -o /tmp/flutter.tar.xz \
+            "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+          echo "$FLUTTER_SHA256  /tmp/flutter.tar.xz" | sha256sum -c -
+          tar xf /tmp/flutter.tar.xz -C /tmp/flsdk
+          /tmp/flsdk/flutter/bin/flutter --version
+
+      - name: web_deps.tar.gz — ogv.js / yuv-canvas / libopus codecs (pinned)
+        run: |
+          curl -fsSL -o /tmp/web_deps.tar.gz \
+            "https://github.com/rustdesk/doc.rustdesk.com/releases/download/console/web_deps.tar.gz"
+          echo "$WEBDEPS_SHA256  /tmp/web_deps.tar.gz" | sha256sum -c -
+
+      - name: Yarn Berry 3.6.4 standalone (sha256-verified)
+        run: |
+          curl -fsSL -o /tmp/yarn-3.6.4.cjs \
+            "https://repo.yarnpkg.com/3.6.4/packages/yarnpkg-cli/bin/yarn.js"
+          echo "$YARN_SHA256  /tmp/yarn-3.6.4.cjs" | sha256sum -c -
+          node /tmp/yarn-3.6.4.cjs -v
+
+      - name: protoc 36.2 (npm package — no system protoc needed)
+        run: |
+          mkdir -p /tmp/protocpkg && cd /tmp/protocpkg
+          npm install --silent protoc@36.2.0
+          ./node_modules/.bin/protoc --version
+
+      - name: Pinned fallback fonts (fonts/manifest.json -> fonts/dl/)
+        run: scripts/fetch_fonts.sh
+
+      - name: Build — JS bridge, flutter web, offline/PWA patches
+        env:
+          FONTS_DIR: ${{ github.workspace }}/fonts
+          USE_PATH_DEPS: '0'   # runners reach github.com; keep the git deps
+        run: scripts/build_web.sh
+
+      - name: e2e offline/PWA proof (headless chromium)
+        run: |
+          (
+            mkdir -p /tmp/e2e && cd /tmp/e2e
+            npm init -y >/dev/null 2>&1
+            npm install --silent playwright@"$PLAYWRIGHT_VERSION"
+            npx playwright install --with-deps chromium
+          )
+          NODE_PATH=/tmp/e2e/node_modules \
+            WEB_DIR=/tmp/rd125/flutter/build/web \
+            node scripts/e2e_offline.cjs
+
+      - name: build-info.json + provenance manifest
+        run: |
+          mkdir -p provenance
+          cp /tmp/rd125/artifact.sha256 provenance/
+          python3 scripts/write_build_info.py
+
+      - name: Commit provenance (weekly activity keeps the schedule alive)
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add build-info.json provenance/artifact.sha256
+          if ! git diff --staged --quiet; then
+            git commit -m "weekly build $(date -u +%F): rustdesk@${RD_TAG}, flutter ${FLUTTER_VERSION}"
+            git push
+          else
+            echo 'nothing to commit'
+          fi
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: /tmp/rd125/flutter/build/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
