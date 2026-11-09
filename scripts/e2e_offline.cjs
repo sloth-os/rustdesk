@@ -18,7 +18,15 @@
 //          'rendezvous-server' key (old builds left it pointing at the
 //          public fleet) is seeded, api/audit server resolution and an
 //          explicit connect attempt are exercised — no rustdesk.com
-//          socket or request may ever appear.
+//          socket or request may ever appear. That gate is three-layered:
+//          playwright 'request' events, 'websocket' events (completed-
+//          handshake only), and a WebSocket CONSTRUCTOR hook — an attempt
+//          that fails before the upgrade fires NEITHER playwright event
+//          (demonstrated against the live pre-deploy build: 3 fleet
+//          constructions, 0 events). The connect attempt must fail fast
+//          locally with a "Connection Error" msgbox — asserted via a stub
+//          of window.onGlobalEvent, which in production Dart registers
+//          only per connection session, never on the home page.
 // Phase 2: HARD PATH — go offline immediately (no online reload first).
 //          Reload: navigation, jds/*.js?v=, canvaskit, fonts, ogv workers
 //          (?version=) must all come from cache.
@@ -117,9 +125,17 @@ function watch(page, tag) {
       failures.push(`${tag}: pageerror: ${t.slice(0, 160)}`); });
   page.on('requestfailed', (r) => {
     const u = r.url();
-    console.log(`${ts()} [${tag} requestfailed]`, u, r.failure()?.errorText);
+    const err = r.failure()?.errorText;
+    console.log(`${ts()} [${tag} requestfailed]`, u, err);
     if (u.includes('flutter_service_worker.js')) return;  // SW update ping, expected offline
-    if (new URL(u).host === HOST) failures.push(`${tag}: same-origin requestfailed ${u} (${r.failure()?.errorText})`);
+    // ERR_ABORTED is a client-side cancellation, not a load failure: the
+    // phase-4 controllerchange auto-reload kills the doomed document's
+    // in-flight fetches BY DESIGN (that is the handoff working — observed in
+    // CI as main.dart.js aborted mid-fallback). If a cancelled resource was
+    // genuinely needed, the successor document re-requests it and real
+    // breakage still surfaces via the 404/render/timeout assertions.
+    if (err === 'net::ERR_ABORTED') return;
+    if (new URL(u).host === HOST) failures.push(`${tag}: same-origin requestfailed ${u} (${err})`);
   });
   page.on('request', (r) => { const u = r.url();
     if (/gstatic|googleapis|google\.com/.test(u)) failures.push(`${tag}: external font/cdn request ${u}`);
@@ -133,6 +149,23 @@ function watch(page, tag) {
     if (/(^|\.)rustdesk\.com$/.test(new URL(ws.url()).hostname))
       failures.push(`${tag}: WebSocket to rustdesk.com public infrastructure: ${ws.url()}`);
   });
+}
+
+// Per-document zero-traffic gate at the construction level: fail if ANY
+// WebSocket to a rustdesk.com host was even CONSTRUCTED in this document
+// (handshake outcome irrelevant — see the addInitScript hook rationale).
+// Must be called per phase: every reload gets a fresh window, and the
+// module-scope fleet probe would re-run in each document that had it.
+async function wsConstructionGate(page, tag) {
+  const built = await page.evaluate(() => window.__wsConstructions || []).catch(() => []);
+  const fleet = built.filter((u) => {
+    try { return /(^|\.)rustdesk\.com$/.test(new URL(u).hostname); }
+    catch { return /rustdesk\.com/.test(u); }
+  });
+  console.log(`${ts()} [${tag}] WebSocket constructions: ${built.length}` +
+    (fleet.length ? ` — FLEET HIT: ${JSON.stringify(fleet)}` : ''));
+  if (fleet.length)
+    failures.push(`${tag}: WebSocket to rustdesk.com CONSTRUCTED (regardless of handshake outcome): ${fleet.join(', ')}`);
 }
 
 async function waitBoot(page, tag, ms = 90000) {
@@ -232,6 +265,25 @@ let HOST;
   // by the phase-1 connect attempt below plus the rustdesk.com gates.
   await ctx.addInitScript(() => {
     try { localStorage.setItem('rendezvous-server', 'rs-sg.rustdesk.com'); } catch {}
+    // Strongest zero-traffic observation point: hook the WebSocket
+    // CONSTRUCTOR. Playwright's 'websocket' event only fires for handshakes
+    // that reach the upgrade — a fleet probe that fails early (DNS refused,
+    // TCP reset — common from CI runners and proxies) fires NEITHER 'request'
+    // NOR 'websocket' (empirically demonstrated against the live pre-deploy
+    // build: 3 fleet constructions visible, 0 playwright events). The hook
+    // makes attempts observable regardless of handshake outcome.
+    try {
+      window.__wsConstructions = [];
+      const Orig = window.WebSocket;
+      window.WebSocket = class extends Orig {
+        constructor(url, protocols) {
+          window.__wsConstructions.push(String(url));
+          super(url, protocols);
+        }
+      };
+      for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'])
+        Object.defineProperty(window.WebSocket, k, { value: Orig[k] });
+    } catch {}
   });
   const page = await ctx.newPage();
 
@@ -283,10 +335,38 @@ let HOST;
   if (/rustdesk\.com/.test(String(apiServer)) || /rustdesk\.com/.test(String(auditServer)))
     failures.push(`p1: api/audit server resolves to public infrastructure: ${apiServer} / ${auditServer}`);
   // The connect must fail LOCALLY (getDefaultUri() yields the invalid
-  // "wss://:21118", surfaced as a msgbox) without opening any socket; if
-  // anything dials the fleet, the websocket gate above fails the run.
+  // "wss://:21118"; start()'s catch turns it into a "Connection Error"
+  // msgbox) without opening any socket; if anything dials the fleet, the
+  // websocket gate above fails the run.
+  // Dart registers window.onGlobalEvent (web_model.dart setEventCallback)
+  // some frames AFTER first paint — a connect that races ahead of it makes
+  // the bridge's msgbox call throw a bare ReferenceError that reaches no one
+  // (harmless, but it dirties the pageerror log and leaves the fail-fast
+  // path unasserted). Wait for the registration, then instrument it so the
+  // msgbox is verified positively instead of merely not-timing-out.
+  // Dart registers window.onGlobalEvent only PER CONNECTION SESSION
+  // (model.dart updateEventListener -> web_model.dart setEventCallback) —
+  // the home/login app never does, so waiting for it is futile and an
+  // unstubbed msgbox call throws a bare ReferenceError into the void.
+  // Stub the callback exactly like Dart would: the fail-fast msgbox
+  // becomes positively assertable.
+  await page.evaluate(() => {
+    const orig = window.onGlobalEvent;
+    window.__globalEvents = [];
+    window.onGlobalEvent = (m) => {
+      window.__globalEvents.push(String(m));
+      if (typeof orig === 'function') return orig(m);
+    };
+  });
   await page.evaluate(() => window.setByName('connect', '123456789'));
   await page.waitForTimeout(4000);
+  {
+    const evs = await page.evaluate(() => window.__globalEvents);
+    console.log(`${ts()} [p1] global events after connect:`, JSON.stringify(evs).slice(0, 300));
+    if (!evs.some((m) => m.includes('"name":"msgbox"') && m.includes('Connection Error')))
+      failures.push('p1: connect without a rendezvous server produced no "Connection Error" msgbox — local fail-fast path broken');
+  }
+  await wsConstructionGate(page, 'p1');
   console.log(`${ts()} [p1] connect attempt done — gate saw no rustdesk.com traffic`);
 
   // ---- phase 2: offline IMMEDIATELY, reload (hard path) ----
@@ -299,11 +379,13 @@ let HOST;
   if (!p2msgs.some((t) => t.includes('Loading app from service worker.')))
     failures.push('p2: no "Loading app from service worker." line while offline (SW not controlling?)');
   await renderCheck(page, 'p2');
+  await wsConstructionGate(page, 'p2');
 
   // ---- phase 3: second offline reload ----
   await page.reload({ waitUntil: 'domcontentloaded' });
   await waitBoot(page, 'p3');
   await renderCheck(page, 'p3');
+  await wsConstructionGate(page, 'p3');
 
   // ---- phase 4: deploy handoff. Simulate a weekly redeploy under a live
   // session: mutate the on-disk bridge (md5 change => activate() evicts the
@@ -356,6 +438,7 @@ let HOST;
       fetch('jds/index.js').then((r) => r.text()).then((t) => t.includes(mk)), MARKER);
     if (!fresh) failures.push('p4: post-handoff document was still served the STALE bridge (marker missing)');
     await renderCheck(page, 'p4');
+    await wsConstructionGate(page, 'p4');
     console.log(`${ts()} [p4] deploy handoff complete: ${navs.length} navigations, fresh bridge served`);
   } finally {
     fs.writeFileSync(fJds, backup.jds);
