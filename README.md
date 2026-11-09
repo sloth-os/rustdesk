@@ -24,6 +24,15 @@ One online visit makes the app fully usable offline (LAN without internet):
   `/rustdesk/` (origin-derived keys, `?v=`/`?version=` query mismatch,
   path-absolute `/` in `addAll`). All fixed, with hygiene asserts in the
   build.
+- **https-correct.** The stock 1.2.5 JS bridge hard-codes `ws://` and
+  probes rendezvous servers at module scope; on the https Pages site
+  `new WebSocket("ws://…")` throws `SecurityError`, aborting the whole
+  ES-module eval — `window.init` never gets defined and the app hangs on
+  the loading spinner forever. The build patches the bridge: the
+  websocket schema follows the page scheme (`https:` → `wss://`), and the
+  latency probe can never abort module eval. The e2e gate itself serves
+  the app over https with a mixed-content canary, so this class of bug
+  fails CI, not production.
 - **Proven weekly-fresh.** Every run asserts the pinned toolchain and
   source SHAs, and the e2e gate must pass before anything is deployed.
 
@@ -38,7 +47,8 @@ GitHub's workflow token cannot set the Pages source. Do once:
 .github/workflows/pages.yml   weekly pipeline: build → e2e gate → deploy
 scripts/build_web.sh          canonical build (JS bridge + flutter web + patches)
 scripts/fetch_fonts.sh        download + sha256-verify pinned gstatic fonts
-scripts/e2e_offline.cjs       headless-chromium offline/PWA proof (the CI gate)
+scripts/e2e_offline.cjs       headless-chromium offline/PWA proof (the CI gate;
+ https origin + mixed-content canary)
 scripts/write_build_info.py   weekly provenance record (build-info.json)
 fonts/manifest.json           pinned font list (family/version/sha256/bytes)
 vendor/web_deps.tar.gz        ogv.js/yuv-canvas/libopus codecs (sha256-pinned;

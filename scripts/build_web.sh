@@ -57,6 +57,72 @@ else
     log "  extracted web deps ($(tar tzf "$WEBDEPS" | wc -l) files)"
   fi
   cd web/js || exit 1
+  # https correctness patch (idempotent, assert-anchored). Stock 1.2.5
+  # hard-codes ws:// and fires a latency probe at module scope; on the
+  # https Pages site `new WebSocket("ws://…")` throws SecurityError
+  # synchronously, ES module eval aborts, window.init is never defined
+  # and the app hangs on the loading spinner forever. (The e2e gate now
+  # serves https too, so this class of bug fails CI loudly.)
+  python3 - <<'PYEOF'
+p = 'src/connection.ts'
+s = open(p).read()
+changed = []
+# (a) schema follows the page scheme: every rendezvous/relay URI is
+# built from this one constant
+if 'const SCHEMA = window.location.protocol' not in s:
+    old = 'const SCHEMA = "ws://";'
+    new = '''// Follow the page scheme: a hard-coded ws:// is mixed content on an
+// https deployment — `new WebSocket("ws://…")` throws SecurityError
+// synchronously, which kills the whole module (see testDelay below).
+const SCHEMA = window.location.protocol === "https:" ? "wss://" : "ws://";'''
+    assert s.count(old) == 1, 'SCHEMA anchor missing'
+    s = s.replace(old, new, 1)
+    changed.append('schema follows page scheme')
+# (b) the module-scope latency probe must never be able to abort module
+# eval — guard the synchronous construction phase
+if 'testDelay skipped' not in s:
+    old = '''function testDelay() {
+  var nearest = "";
+  HOSTS.forEach((host) => {
+    const now = new Date().getTime();
+    new Websock(getrUriFromRs(host), true).open().then(() => {
+      console.log("latency of " + host + ": " + (new Date().getTime() - now));
+      if (!nearest) {
+        HOST = host;
+        localStorage.setItem("rendezvous-server", host);
+      }
+    });
+  });
+}'''
+    new = '''function testDelay() {
+  var nearest = "";
+  // Guarded: testDelay() runs at module scope, so a synchronous throw
+  // here (mixed-content SecurityError from a ws:// URL on an https
+  // page) aborts the entire ES module eval — window.init & the whole
+  // bridge API stay undefined and the app hangs on the spinner
+  // forever. A latency probe must never be able to kill the module.
+  try {
+    HOSTS.forEach((host) => {
+      const now = new Date().getTime();
+      new Websock(getrUriFromRs(host), true).open().then(() => {
+        console.log("latency of " + host + ": " + (new Date().getTime() - now));
+        if (!nearest) {
+          HOST = host;
+          localStorage.setItem("rendezvous-server", host);
+        }
+      });
+    });
+  } catch (e) {
+    console.warn("testDelay skipped: " + e);
+  }
+}'''
+    assert s.count(old) == 1, 'testDelay anchor missing'
+    s = s.replace(old, new, 1)
+    changed.append('testDelay guarded')
+open(p, 'w').write(s)
+print('  connection.ts:', ', '.join(changed) if changed else 'already patched')
+PYEOF
+  [ $? -eq 0 ] || { log "BRIDGE_PATCH_FAIL"; exit 1; }
   # --no-immutable: runners export CI=true, which makes Yarn default to
   # immutable installs; the upstream lockfile isn't install-clean under
   # 3.6.4 (YN0028), and mutation is fine in this disposable tree.
@@ -388,6 +454,7 @@ import json, os, re, sys
 sw = open('flutter_service_worker.js').read()
 ih = open('index.html').read()
 mdj = open('main.dart.js', encoding='utf-8').read()
+jds = open('jds/index.js').read()
 man = json.load(open('manifest.json'))
 
 # patch markers
@@ -402,6 +469,13 @@ checks = [
   ('firebase gone', ih.count('firebase'), 0),
   ('gstatic gone from main.dart.js', mdj.count('gstatic'), 0),
   ('canvaskit local', ih.count('canvaskit'), 0),  # no canvaskit URL in html; engine uses dart-define
+  # bridge https correctness — the [0] source patch survived minify
+  # (string literals are stable through esbuild; "ws://" count 1 = the
+  # http branch of the conditional, NOT a bare hard-coded schema)
+  ('bridge wss branch', jds.count('"wss://"'), 1),
+  ('bridge page-scheme probe', jds.count('"https:"'), 1),
+  ('bridge ws branch (http pages)', jds.count('"ws://"'), 1),
+  ('bridge testDelay guard', jds.count('testDelay skipped'), 1),
 ]
 ok = True
 for name, got, want in checks:

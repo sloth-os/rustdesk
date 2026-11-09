@@ -12,8 +12,10 @@
 #      (canvaskit, --no-web-resources-cdn), the offline/PWA patch set
 #      (local fonts + canvaskit, subpath service worker, full precache
 #      incl. lazily-loaded codec wasm, firebase strip), hygiene asserts
-#   5. scripts/e2e_offline.cjs  — headless-chromium proof: 165/165 precache,
-#      offline reloads render, zero external requests
+#   5. scripts/e2e_offline.cjs  — headless-chromium proof over an https
+#      origin (mixed-content canary + bridge window.init liveness, so the
+#      ws://-on-https class of bug fails CI, not production): 165/165
+#      precache, offline reloads render, zero external requests
 #   6. commits build-info.json + per-file sha256 manifest — weekly
 #      provenance, and the repo activity that keeps this scheduled workflow
 #      from being auto-disabled after 60 idle days (no keepalive action:

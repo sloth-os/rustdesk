@@ -1,8 +1,19 @@
-// e2e offline/PWA validation of the RustDesk web build (subpath /rustdesk/).
+// e2e offline/PWA validation of the RustDesk web build (subpath /rustdesk/),
+// served over HTTPS with a self-signed cert — like the Pages deployment.
+//
+// https is load-bearing, not cosmetic: a secure page forbids ws://
+// WebSockets — `new WebSocket("ws://…")` throws SecurityError
+// SYNCHRONOUSLY. The stock 1.2.5 bridge hard-codes ws:// and probes
+// servers at module scope, so on https its ES-module eval aborted,
+// window.init was never defined and the app hung on the spinner forever —
+// while this gate, serving plain http://127.0.0.1 (secure context by
+// localhost exemption, but NO transport mixed-content enforcement),
+// passed green. Hence: https server + mixed-content canary + window.init
+// liveness assert below, so that class of bug fails CI, not production.
 //
 // Phase 1: first visit online — SW installs, precaches every RESOURCES entry
 //          (incl. lazily-loaded codec wasm); no external font/cdn requests;
-//          app renders.
+//          app renders; bridge module evaluated (window.init defined).
 // Phase 2: HARD PATH — go offline immediately (no online reload first).
 //          Reload: navigation, jds/*.js?v=, canvaskit, fonts, ogv workers
 //          (?version=) must all come from cache.
@@ -18,9 +29,11 @@
 //   WEB_DIR    build/web to serve (default /tmp/rd125/flutter/build/web)
 //   CHROME_PATH  optional chromium executable (default: playwright registry)
 // NODE_PATH   makes require('playwright-core') resolvable in CI
-const http = require('http');
+const https = require('https');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 let chromium;
 try { ({ chromium } = require('playwright-core')); }
@@ -43,7 +56,25 @@ const ts = () => `[+${String(Math.round((Date.now() - t0) / 1000)).padStart(3)}s
 // regardless.
 const NOISE = /rendezvous|websocket|WebSock|CloseEvent|ws:|wss:|net::ERR|failed to fetch|offline|Flutter Web/i;
 
-const server = http.createServer((req, res) => {
+// Self-signed cert for the local https origin (openssl ships on the
+// runner images; the browser ignores cert errors via the launch flag
+// below, the SAN keeps the cert broadly well-formed anyway).
+const certDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rd-e2e-https-'));
+const keyFile = path.join(certDir, 'key.pem');
+const certFile = path.join(certDir, 'cert.pem');
+try {
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048',
+    '-keyout', keyFile, '-out', certFile, '-days', '2', '-nodes',
+    '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'],
+    { stdio: 'pipe' });
+} catch (e) {
+  console.error('E2E_SETUP_FAIL: cannot generate self-signed cert (openssl missing?):', String(e.message));
+  process.exit(1);
+}
+
+const server = https.createServer(
+  { key: fs.readFileSync(keyFile), cert: fs.readFileSync(certFile) },
+  (req, res) => {
   let p;
   try { p = decodeURIComponent(new URL(req.url, 'http://x').pathname); }
   catch { res.writeHead(400).end('bad url'); return; }
@@ -60,9 +91,21 @@ const server = http.createServer((req, res) => {
 
 function watch(page, tag) {
   page.on('console', (m) => { const t = m.text();
-    if (m.type() === 'error' && !NOISE.test(t))
+    if (m.type() !== 'error') return;
+    // the live-site killer signature: an https page blocking a ws://
+    // WebSocket. NOISE must not swallow this one — but the canary's own
+    // deliberate ws:// construction below is expected, not a defect.
+    if (/mixed content.*websocket|insecure websocket/i.test(t)) {
+      if (!t.includes('mixed-content-canary'))
+        failures.push(`${tag}: MIXED CONTENT — insecure WebSocket blocked: ${t.slice(0, 160)}`);
+      else console.log(`${ts()} [${tag}] canary console.error (expected): ${t.slice(0, 120)}`);
+    }
+    else if (!NOISE.test(t))
       failures.push(`${tag}: console.error ${t.slice(0, 160)}`); });
-  page.on('pageerror', (e) => console.log(`${ts()} [${tag} pageerror]`, String(e).slice(0, 220)));
+  page.on('pageerror', (e) => { const t = String(e);
+    console.log(`${ts()} [${tag} pageerror]`, t.slice(0, 220));
+    if (/insecure WebSocket|SecurityError/i.test(t))
+      failures.push(`${tag}: pageerror: ${t.slice(0, 160)}`); });
   page.on('requestfailed', (r) => {
     const u = r.url();
     console.log(`${ts()} [${tag} requestfailed]`, u, r.failure()?.errorText);
@@ -150,19 +193,48 @@ let HOST;
   if (missing.length) failures.push(`pre-check: RESOURCES missing on disk: ${missing.join(', ')}`);
 
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const ORIGIN = `http://127.0.0.1:${server.address().port}`;
+  const ORIGIN = `https://127.0.0.1:${server.address().port}`;
   HOST = new URL(ORIGIN).host;
   const APP_URL = ORIGIN + '/rustdesk/';
   console.log(`${ts()} serving ${WEB} at ${APP_URL}`);
 
+  // --ignore-certificate-errors at the BROWSER level (context-level
+  // ignoreHTTPSErrors historically misses service-worker fetches): the
+  // origin stays a secure context — mixed-content enforcement is fully
+  // active, which is the entire point of the https server.
   const browser = await chromium.launch({ headless: true,
+    args: ['--ignore-certificate-errors'],
     ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}) });
-  const ctx = await browser.newContext({ locale: 'zh-CN' });
+  // context-level too (belt-and-braces next to the browser flag above)
+  const ctx = await browser.newContext({ locale: 'zh-CN', ignoreHTTPSErrors: true });
   const page = await ctx.newPage();
 
   // ---- phase 1: first visit, online ----
   watch(page, 'p1');
   await page.goto(APP_URL, { waitUntil: 'domcontentloaded' });
+
+  // Mixed-content canary: this gate is only meaningful if the environment
+  // actually enforces what killed the live site — ws:// from this https
+  // page MUST throw SecurityError synchronously. If it ever stops
+  // throwing (launch flag lost, scheme regressed to http), fail loudly: a
+  // vacuously-green gate is worse than no gate.
+  const canary = await page.evaluate(() => {
+    try { new WebSocket('ws://mixed-content-canary.invalid:21118'); return 'NO_THROW'; }
+    catch (e) { return (e && e.name) || String(e); }
+  });
+  console.log(`${ts()} [p1] mixed-content canary (ws:// from https page): ${canary}`);
+  if (canary !== 'SecurityError')
+    failures.push(`canary: ws:// WebSocket did not throw SecurityError on this https page (${canary}) — the gate would be blind`);
+
+  // Bridge liveness: jds/index.js is a deferred module script, so by
+  // DOMContentLoaded it has either evaluated (window.init defined) or
+  // aborted mid-eval — the live-site hang, where init stayed undefined
+  // forever while the spinner spun.
+  const initType = await page.evaluate(() => typeof window.init);
+  console.log(`${ts()} [p1] window.init: ${initType}`);
+  if (initType !== 'function')
+    failures.push(`p1: window.init is ${initType} at DOMContentLoaded — bridge ES-module eval aborted`);
+
   await waitBoot(page, 'p1');
   let n = 0;
   const tPoll = Date.now();
