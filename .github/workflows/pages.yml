@@ -5,7 +5,8 @@
 # Pipeline (pinned end-to-end; every download sha256-verified):
 #   1. rustdesk/rustdesk at tag 1.2.5 — SHA-asserted against RD_SHA
 #   2. Flutter 3.19.6 tarball, Yarn Berry 3.6.4 standalone cjs, protoc 36.2
-#      (npm), Node 24
+#      (npm), Node 24; web_deps codec tarball vendored in-repo (the
+#      release-asset CDN persistently 504s runner IPs)
 #   3. scripts/fetch_fonts.sh   — pinned gstatic fallback fonts
 #   4. scripts/build_web.sh     — JS bridge (yarn/vite), flutter build web
 #      (canvaskit, --no-web-resources-cdn), the offline/PWA patch set
@@ -80,11 +81,9 @@ jobs:
           tar xf /tmp/flutter.tar.xz -C /tmp/flsdk
           /tmp/flsdk/flutter/bin/flutter --version
 
-      - name: web_deps.tar.gz — ogv.js / yuv-canvas / libopus codecs (pinned)
+      - name: web_deps.tar.gz — vendored ogv.js / yuv-canvas / libopus codecs
         run: |
-          curl $CURL_FLAGS -o /tmp/web_deps.tar.gz \
-            "https://github.com/rustdesk/doc.rustdesk.com/releases/download/console/web_deps.tar.gz"
-          echo "$WEBDEPS_SHA256  /tmp/web_deps.tar.gz" | sha256sum -c -
+          echo "$WEBDEPS_SHA256  vendor/web_deps.tar.gz" | sha256sum -c -
 
       - name: Yarn Berry 3.6.4 standalone (sha256-verified)
         run: |
@@ -105,6 +104,7 @@ jobs:
       - name: Build — JS bridge, flutter web, offline/PWA patches
         env:
           FONTS_DIR: ${{ github.workspace }}/fonts
+          WEBDEPS: ${{ github.workspace }}/vendor/web_deps.tar.gz
           USE_PATH_DEPS: '0'   # runners reach github.com; keep the git deps
         run: scripts/build_web.sh
 

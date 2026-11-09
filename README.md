@@ -41,14 +41,17 @@ scripts/fetch_fonts.sh        download + sha256-verify pinned gstatic fonts
 scripts/e2e_offline.cjs       headless-chromium offline/PWA proof (the CI gate)
 scripts/write_build_info.py   weekly provenance record (build-info.json)
 fonts/manifest.json           pinned font list (family/version/sha256/bytes)
+vendor/web_deps.tar.gz        ogv.js/yuv-canvas/libopus codecs (sha256-pinned;
+                              vendored — the release-asset CDN persistently
+                              504s GitHub runner IPs)
 build-info.json               last build's provenance (committed weekly)
 provenance/artifact.sha256   per-file sha256 manifest of the deployed artifact
 ```
 
 Everything is pinned: rustdesk source SHA, Flutter 3.19.6 tarball sha256,
-Yarn Berry 3.6.4 cjs sha256, protoc 36.2.0 (npm), web_deps codec tarball
-sha256, font files sha256. The committed `pubspec.lock` pins the pub deps
-(7 git deps at locked SHAs).
+Yarn Berry 3.6.4 cjs sha256, protoc 36.2.0 (npm), the vendored web_deps
+codec tarball sha256, font files sha256. The committed `pubspec.lock`
+pins the pub deps (7 git deps at locked SHAs).
 
 The weekly `build-info.json` commit doubles as the repository activity
 that keeps the scheduled workflow from being auto-disabled after 60 idle
