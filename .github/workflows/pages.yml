@@ -39,6 +39,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # transient CDN hiccups (504s) on release-asset downloads are routine;
+  # every curl retries before failing
+  CURL_FLAGS: >-
+    --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30
+    --fail --location --silent --show-error
   RD_TAG: '1.2.5'
   RD_SHA: '7d56717cf56bc3535832e2a89e4a87c5ca753f1e'
   FLUTTER_VERSION: '3.19.6'
@@ -69,7 +74,7 @@ jobs:
       - name: Flutter ${{ env.FLUTTER_VERSION }} (sha256-verified)
         run: |
           mkdir -p /tmp/flsdk
-          curl -fsSL -o /tmp/flutter.tar.xz \
+          curl $CURL_FLAGS -o /tmp/flutter.tar.xz \
             "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
           echo "$FLUTTER_SHA256  /tmp/flutter.tar.xz" | sha256sum -c -
           tar xf /tmp/flutter.tar.xz -C /tmp/flsdk
@@ -77,13 +82,13 @@ jobs:
 
       - name: web_deps.tar.gz — ogv.js / yuv-canvas / libopus codecs (pinned)
         run: |
-          curl -fsSL -o /tmp/web_deps.tar.gz \
+          curl $CURL_FLAGS -o /tmp/web_deps.tar.gz \
             "https://github.com/rustdesk/doc.rustdesk.com/releases/download/console/web_deps.tar.gz"
           echo "$WEBDEPS_SHA256  /tmp/web_deps.tar.gz" | sha256sum -c -
 
       - name: Yarn Berry 3.6.4 standalone (sha256-verified)
         run: |
-          curl -fsSL -o /tmp/yarn-3.6.4.cjs \
+          curl $CURL_FLAGS -o /tmp/yarn-3.6.4.cjs \
             "https://repo.yarnpkg.com/3.6.4/packages/yarnpkg-cli/bin/yarn.js"
           echo "$YARN_SHA256  /tmp/yarn-3.6.4.cjs" | sha256sum -c -
           node /tmp/yarn-3.6.4.cjs -v
